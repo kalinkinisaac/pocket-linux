@@ -19,7 +19,7 @@ ARG GUEST_ARCH=x86_64
 ARG STATIC=1
 RUN apk add --no-cache build-base python3 py3-setuptools meson ninja-build pkgconf bash perl flex bison \
       linux-headers curl xz git glib-dev glib-static pixman-dev pixman-static zlib-dev zlib-static \
-      pcre2-dev pcre2-static gettext-static libffi-dev
+      pcre2-dev pcre2-static gettext-static libffi-dev util-linux-static ncurses-static bzip2-static
 # libslirp (user-mode NAT networking) has no static package in Alpine -> build it
 RUN curl -fsSL --retry 5 --retry-all-errors https://gitlab.freedesktop.org/slirp/libslirp/-/archive/v${SLIRP_VERSION}/libslirp-v${SLIRP_VERSION}.tar.gz | tar -xz -C /tmp \
  && cd /tmp/libslirp-v${SLIRP_VERSION} && meson setup b --prefix=/usr --default-library=both --buildtype=release \
@@ -35,6 +35,7 @@ RUN set -e; FDT=--enable-fdt=internal; [ "$GUEST_ARCH" = x86_64 ] && FDT=--disab
       --disable-rbd --disable-glusterfs --disable-libiscsi --disable-libnfs --disable-xen --disable-gnutls \
       --disable-nettle --disable-gcrypt --disable-capstone --disable-libssh --disable-bpf --disable-seccomp \
       --disable-libudev --disable-guest-agent --disable-linux-io-uring --disable-libdw --disable-zstd \
+      --disable-curses --disable-bzip2 --disable-gio \
       --enable-tools --enable-slirp --enable-virtfs --enable-kvm --enable-tcg $FDT --disable-werror; \
     test -f build.ninja; \
     ninja qemu-system-${GUEST_ARCH} qemu-img \
