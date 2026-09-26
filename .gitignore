@@ -1,0 +1,5 @@
+dist/
+*.qcow2
+*.raw
+*.tar.gz
+*.log

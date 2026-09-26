@@ -1,0 +1,156 @@
+#!/bin/sh
+# pocket — a portable Linux VM that needs no root, no installs, no KVM.
+#   pocket up | ssh [cmd] | down | run | desktop | status | log | reset | help
+# Settings via env: POCKET_VARIANT=base|desktop  POCKET_MEM=2048  POCKET_CPUS=auto
+#   POCKET_DISK=20G  POCKET_SSH_PORT=2222  POCKET_PORTS="8080:80 3000"
+#   POCKET_ACCEL=auto|kvm|tcg  POCKET_HOME=~/.pocket  POCKET_SHARE=~/.pocket/share
+#   POCKET_REPO=owner/repo  POCKET_URL=<base url of release files>  POCKET_GUEST=<arch>
+#   POCKET_TAG=latest|vX.Y  GH_TOKEN=<token> (needed if the repo is private)
+set -eu
+REPO=${POCKET_REPO:-OWNER/pocket-linux}
+URL=${POCKET_URL:-https://github.com/$REPO/releases/${POCKET_TAG:+download/}${POCKET_TAG:-latest/download}}
+H=${POCKET_HOME:-$HOME/.pocket}
+VARIANT=${POCKET_VARIANT:-base}
+MEM=${POCKET_MEM:-2048}
+DISK=${POCKET_DISK:-20G}
+SSHP=${POCKET_SSH_PORT:-2222}
+SHARE=${POCKET_SHARE:-$H/share}
+ARCH=$(uname -m); [ "$ARCH" = arm64 ] && ARCH=aarch64
+GUEST=${POCKET_GUEST:-$ARCH}          # VM arch; != host arch works but always emulated (no KVM)
+IMG=pocket-$VARIANT-$GUEST.qcow2
+VM=$H/vm-$VARIANT
+PIDF=$VM/qemu.pid
+
+die() { echo "pocket: $*" >&2; exit 1; }
+say() { echo "» $*" >&2; }
+
+TOKEN=${GH_TOKEN:-${GITHUB_TOKEN:-}}
+TAG=${POCKET_TAG:-latest}
+asset_url() { # private repo: resolve a release asset to its API url (needs token)
+  [ -n "${ASSETS:-}" ] || {
+    r=releases/latest; [ "$TAG" = latest ] || r=releases/tags/$TAG
+    ASSETS=$(curl -fsSL -H "Authorization: Bearer $TOKEN" "https://api.github.com/repos/$REPO/$r") \
+      || die "cannot read releases of $REPO (token/permissions?)"; }
+  echo "$ASSETS" | awk -v n="$1" -F'"' '$2=="url"{u=$4} $2=="name"&&$4==n{print u; exit}'
+}
+
+fetch() { # url dest
+  [ -s "$2" ] && return 0
+  say "downloading $(basename "$2")"
+  if [ -n "$TOKEN" ] && [ -z "${POCKET_URL:-}" ]; then
+    u=$(asset_url "$(basename "$2")"); [ -n "$u" ] || die "asset $(basename "$2") not in release $TAG"
+    curl -fL --progress-bar -H "Authorization: Bearer $TOKEN" -H "Accept: application/octet-stream" -o "$2.part" "$u"
+    mv "$2.part" "$2"; return 0
+  fi
+  if command -v curl >/dev/null; then curl -fL --progress-bar -o "$2.part" "$1"
+  elif command -v wget >/dev/null; then wget -q --show-progress -O "$2.part" "$1"
+  elif command -v python3 >/dev/null; then python3 -c "import urllib.request,sys;urllib.request.urlretrieve(sys.argv[1],sys.argv[2])" "$1" "$2.part"
+  else die "need curl, wget or python3"; fi
+  mv "$2.part" "$2"
+}
+
+setup() {
+  mkdir -p "$H" "$VM" "$SHARE/.pocket"
+  QT=qemu-$ARCH-$GUEST.tar.gz
+  fetch "$URL/$QT" "$H/$QT"
+  [ -d "$H/qemu-$GUEST" ] || { mkdir -p "$H/qemu-$GUEST"; tar -xzf "$H/$QT" -C "$H/qemu-$GUEST"; }
+  fetch "$URL/vmlinuz-$GUEST" "$H/vmlinuz-$GUEST"
+  fetch "$URL/initramfs-$GUEST" "$H/initramfs-$GUEST"
+  fetch "$URL/$IMG" "$H/$IMG"
+  # ssh key only for this VM (port is on 127.0.0.1, but other local users can reach it)
+  [ -f "$H/id_ed25519" ] || ssh-keygen -q -t ed25519 -N '' -C pocket -f "$H/id_ed25519"
+  cp "$H/id_ed25519.pub" "$SHARE/.pocket/authorized_keys"
+  # trust the host's CA bundle (corporate TLS proxies)
+  for c in "${SSL_CERT_FILE:-}" /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do
+    [ -n "$c" ] && [ -s "$c" ] && { cp "$c" "$SHARE/.pocket/host-ca.crt"; break; }
+  done
+  [ -f /etc/timezone ] && cp /etc/timezone "$SHARE/.pocket/tz" || true
+}
+
+qemu() { # static binary by default; a --dynamic build ships lib/ + its own loader
+  Q=$H/qemu-$GUEST; b=$1; shift
+  if [ "${POCKET_SYSTEM_QEMU:-0}" = 1 ]; then "$b" "$@"; return; fi
+  ld=$(ls "$Q"/lib/ld-* 2>/dev/null | head -1)
+  if [ -n "$ld" ]; then "$ld" --library-path "$Q/lib" "$Q/bin/$b" "$@"; else "$Q/bin/$b" "$@"; fi
+}
+
+running() { [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; }
+
+accel() {
+  a=${POCKET_ACCEL:-auto}
+  if [ "$a" = auto ] && [ "$GUEST" != "$ARCH" ]; then a=tcg; fi
+  if [ "$a" = auto ]; then
+    if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then a=kvm; else a=tcg; fi
+  fi
+  echo "$a"
+}
+
+run_vm() { # extra qemu args in "$@"
+  a=$(accel); n=$(nproc 2>/dev/null || echo 2)
+  CPUS=${POCKET_CPUS:-auto}; [ "$CPUS" = auto ] && { CPUS=$n; [ "$CPUS" -gt 4 ] && CPUS=4; }
+  if [ "$a" = kvm ]; then ACC="-accel kvm -cpu host"
+  else ACC="-accel tcg,thread=multi,tb-size=512 -cpu max"; fi
+  case $GUEST in
+    x86_64)  MACH="-M pc -vga none"; CON=ttyS0 ;;
+    aarch64) MACH="-M virt"; CON=ttyAMA0 ;;
+    riscv64) MACH="-M virt"; CON=ttyS0 ;;
+    *) die "unsupported guest arch $GUEST" ;;
+  esac
+  FWD="hostfwd=tcp:127.0.0.1:$SSHP-:22"
+  P=${POCKET_PORTS:-}; [ "$VARIANT" = desktop ] && P="$P 5901 6080"
+  for p in $P; do h=${p%%:*}; g=${p#*:}; FWD="$FWD,hostfwd=tcp:127.0.0.1:$h-:$g"; done
+  [ -f "$VM/disk.qcow2" ] || qemu qemu-img create -q -f qcow2 -F qcow2 -b "$H/$IMG" "$VM/disk.qcow2" "$DISK"
+  say "guest=$GUEST accel=$a cpus=$CPUS mem=${MEM}M  ssh=127.0.0.1:$SSHP  share=$SHARE -> /host"
+  # shellcheck disable=SC2086
+  qemu "qemu-system-$GUEST" $MACH $ACC -smp "$CPUS" -m "$MEM" -L "$H/qemu-$GUEST/share" \
+    -kernel "$H/vmlinuz-$GUEST" -initrd "$H/initramfs-$GUEST" \
+    -append "root=/dev/vda rootfstype=ext4 modules=ext4,virtio_blk console=$CON quiet" \
+    -drive file="$VM/disk.qcow2",if=virtio,cache=unsafe,discard=unmap,detect-zeroes=unmap \
+    -netdev user,id=n0,$FWD -device virtio-net-pci,netdev=n0,romfile= \
+    -virtfs local,path="$SHARE",mount_tag=host,security_model=none,id=host \
+    -device virtio-rng-pci "$@"
+}
+
+S() { ssh -q -i "$H/id_ed25519" -p "$SSHP" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -o LogLevel=ERROR -o ConnectTimeout=5 root@127.0.0.1 "$@"; }
+
+up() {
+  running && { say "already running"; return 0; }
+  setup
+  run_vm -display none -serial file:"$VM/console.log" \
+    -monitor unix:"$VM/monitor.sock",server,nowait -pidfile "$PIDF" -daemonize
+  say "booting (TCG without KVM takes ~1 min) ..."
+  i=0; while ! S true 2>/dev/null; do
+    i=$((i+1)); [ $i -gt 120 ] && die "no ssh after 10 min, see: pocket log"
+    running || die "qemu exited, see: pocket log"; sleep 5
+  done
+  say "ready: pocket ssh"
+  [ "$VARIANT" = desktop ] && desktop || true
+}
+
+down() {
+  running || { say "not running"; return 0; }
+  S poweroff 2>/dev/null || true
+  i=0; while running && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done
+  running && kill "$(cat "$PIDF")" 2>/dev/null; rm -f "$PIDF"; say "stopped"
+}
+
+desktop() {
+  [ "$VARIANT" = desktop ] || die "use POCKET_VARIANT=desktop"
+  S pocket-desktop >/dev/null
+  say "desktop: open http://localhost:6080/vnc.html  (or VNC client -> localhost:5901)"
+}
+
+case ${1:-help} in
+  up) up ;;
+  ssh) shift; running || up; if [ -t 0 ]; then S -t "$@"; else S "$@"; fi ;;
+  down) down ;;
+  run) setup; running && die "already running in background (pocket ssh)"
+       say "foreground console, exit: Ctrl-A X"
+       run_vm -nographic -serial mon:stdio ;;
+  desktop) running || up; desktop ;;
+  status) if running; then echo "running (pid $(cat "$PIDF"), accel $(accel))"; else echo stopped; fi ;;
+  log) tail -n 50 "$VM/console.log" ;;
+  reset) down; rm -f "$VM/disk.qcow2"; say "disk reset to pristine image" ;;
+  *) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//' ;;
+esac

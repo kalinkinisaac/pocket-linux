@@ -1,0 +1,38 @@
+name: build
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      variant: { description: 'base | desktop | all', default: 'all' }
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64,  runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }   # native arm64 runner, no emulation
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: build
+        run: ./make.sh --arch ${{ matrix.arch }} --variant ${{ inputs.variant || 'all' }} --no-host-ca
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pocket-${{ matrix.arch }}
+          path: dist/${{ matrix.arch }}/*
+          retention-days: 14
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    permissions: { contents: write }
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - uses: softprops/action-gh-release@v2
+        with: { files: dist/* }
