@@ -29,20 +29,38 @@ iptables, overlay2, cgroup v2 — всё как на обычной машине
   скачивает образ, но `crun` падает на `devpts`/cgroups. Docker — нет.
 Кандидат на будущий «быстрый режим без контейнеров».
 
-### 3. User-Mode Linux
-Ядро Linux как обычный процесс; CPU исполняется нативно, системные вызовы — через ptrace.
-Ядро 7.2 из пакета Debian `user-mode-linux`:
-- грузит тот же Alpine-rootfs (`ubd0=disk.raw`), общая папка — `hostfs`;
-- **Docker работает** (overlay2, cgroup v2), контейнер стартует за 0.65 с;
-- в сборке Debian нет `CONFIG_NF_TABLES_IPV4`/`IP_NF_NAT` → bridge-сеть Docker не поднять,
-  только `--network host` (решается своей сборкой ядра);
-- **сеть без root не заработала**: legacy-транспорт slirp удалён из ядра, остался `vector`.
-  `vector` с `transport=l2tpv3,udp=1` (обычный UDP-сокет, root не нужен) в паре с
-  «роутером» `qemu-system-x86_64 -M none -netdev user ... -netdev l2tpv3 ... -netdev hubport`
-  выглядел рабочей схемой, но `vector_net_open` возвращает ошибку, а обработчик ошибки
-  вызывает `napi_disable` на неинициализированной структуре → kernel panic.
-Перспективный путь для «быстрого Docker без KVM», но требует своей сборки ядра и
-отладки/патча сети. Отложено.
+### 3. User-Mode Linux (выбран как быстрый режим без KVM на x86_64)
+Ядро Linux как обычный процесс: код гостя исполняет настоящий CPU, перехватываются только
+системные вызовы (seccomp или ptrace — оба доступны любому пользователю для своих процессов).
+
+**Первая попытка — пакет Debian `user-mode-linux` 7.2:** Docker работал (контейнер 0.65 с), но
+(а) в конфиге нет NAT → только `--network host`; (б) сети без root нет: legacy slirp-транспорт
+удалён, а `vector:transport=l2tpv3` + QEMU-«роутер» падал в `vector_net_open` → `napi_disable`
+на неинициализированной структуре → kernel panic.
+
+**Решение (uml/):**
+- Своё ядро 7.2.8 (текущая стабильная; в 7.x у UML впервые есть SMP — `ncpus=`), статическая
+  линковка, всё встроено (без модулей): NAT/nftables/iptables-legacy, veth/bridge, overlayfs,
+  cgroup v2 + BPF, hostfs, `UML_NET_VECTOR`. После `olddefconfig` сборка проверяет, что ни одна
+  опция из фрагмента не потерялась. 10 минут на 1 ядре, бинарник 10 МБ.
+- Патч 1: `UML_NET_VECTOR` делает `select MAY_HAVE_RUNTIME_DEPS` (из-за getaddrinfo для gre/l2tpv3),
+  что запрещает `STATIC_LINK`. Убираем select — нам нужен только fd-транспорт.
+- Патч 2 (из проекта Haven, github.com/GlassOnTin/uml-transport): `vector_poll` завершал NAPI при
+  `work_done == budget` → под нагрузкой RX «засыпает».
+- Сеть: транспорт `vec0:transport=fd,fd=N` (есть в ядре с 6.x) + свой помощник `pocket-net`
+  (~300 строк C, libslirp статически на musl, 1.2 МБ): создаёт `socketpair(AF_UNIX, SOCK_SEQPACKET)`,
+  запускает ядро с одним концом, на другом крутит slirp (DHCP/DNS/NAT/hostfwd как у QEMU `-netdev user`).
+  SEQPACKET, а не DGRAM: у DGRAM очередь приёмника ограничена `max_dgram_qlen`=10 → потери.
+  Та же идея у Haven (passt вместо libslirp, Android arm64).
+- Гость тот же образ Alpine: сервис `pocket-uml` переименовывает `vec0`→`eth0`, общая папка
+  монтируется через `hostfs` (ядро ограничено `hostfs=$POCKET_SHARE`), fstab на `/dev/root`.
+- RAM гостя UML держит в файле в `$TMPDIR` → нужен каталог с exec и свободным местом ≥ `POCKET_MEM`
+  (лаунчер проверяет `/dev/shm`, `$TMPDIR`, `~/.pocket`).
+
+**Результат (1 vCPU, от непривилегированного пользователя):** загрузка до SSH 6 с (TCG 110 с);
+Docker 28.3.3, overlay2, cgroup v2, **bridge-сеть с NAT**, контейнер выходит в интернет,
+`-p 8080:80` работает; `docker run` 0.75–0.85 с (TCG 8.4 с); pull alpine 1.2 с;
+gzip 742 мс против 653 на хосте; 300 fork+exec 1104 против 251; 2000 файлов 483 против 71.
 
 ### Не подходят
 - Firecracker, Cloud Hypervisor, crosvm — только с KVM.
@@ -68,7 +86,10 @@ iptables, overlay2, cgroup v2 — всё как на обычной машине
 - `apk.static` ставит целую систему в каталог (`--root --initdb`) без Alpine на хосте.
 
 ## Идеи на будущее
-- UML со своим ядром (NAT, исправленный vector/l2tpv3 или свой userspace-роутер) — быстрый режим без KVM.
+- UML: проверить внутри Docker-контейнера хоста (seccomp-профиль Docker, маленький /dev/shm).
+- UML: `seccomp=on` принудительно и замерить против ptrace; проверить SMP на многоядерном хосте.
+- UML для arm64-хостов (форк zalexdev/linux-um-arm64, как у Haven) — не в mainline.
+- macOS/iOS — см. `HANDOFF-MAC.md`, `IOS.md`.
 - Режим `userns`: автоматически, если разрешены user namespaces, для задач без Docker.
 - Снапшоты (`qemu-img snapshot`) и `pocket save/restore`.
 - Образ поменьше: `linux-virt` без лишних модулей, docker без compose.

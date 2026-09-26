@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Reproducible release build in Docker.
 #   ./make.sh [--arch x86_64|aarch64|riscv64] [--guest <arch>] [--variant base|desktop|all]
-#             [--dynamic] [--out dist] [--host-ca]
+#             [--dynamic] [--out dist] [--host-ca] [--no-uml]
 # Result: dist/<arch>/  = files that just run on that arch (see README).
 set -euo pipefail
-ARCH=$(uname -m); GUEST=""; VARIANT=base; OUT=dist; STATIC=1; HOSTCA=auto
+ARCH=$(uname -m); GUEST=""; VARIANT=base; OUT=dist; STATIC=1; HOSTCA=auto; UML=1
 while [ $# -gt 0 ]; do case $1 in
   --arch) ARCH=$2; shift 2;;  --guest) GUEST=$2; shift 2;;  --variant) VARIANT=$2; shift 2;;
   --out) OUT=$2; shift 2;;    --dynamic) STATIC=0; shift;;  --host-ca) HOSTCA=1; shift;;
-  --no-host-ca) HOSTCA=0; shift;;  -h|--help) sed -n 2,6p "$0"; exit 0;;
+  --no-host-ca) HOSTCA=0; shift;;  --no-uml) UML=0; shift;;  -h|--help) sed -n 2,6p "$0"; exit 0;;
   *) echo "unknown arg $1"; exit 1;; esac; done
 GUEST=${GUEST:-$ARCH}
 plat() { case $1 in x86_64|amd64) echo linux/amd64;; aarch64|arm64) echo linux/arm64;;
@@ -41,6 +41,16 @@ for v in $VARIANTS; do
   cp "$T/$v/vmlinuz" "$D/vmlinuz-$GUEST"; cp "$T/$v/initramfs" "$D/initramfs-$GUEST"
   tar -C "$T/$v/qemu" -czf "$D/qemu-$ARCH-$GUEST.tar.gz" .
   cp "$T/$v/pocket" "$D/pocket"; chmod +x "$D/pocket"
+  [ -f "$T/$v/pocket-$v-$GUEST.img.gz" ] && cp "$T/$v/pocket-$v-$GUEST.img.gz" "$D/"
 done
-(cd "$D" && sha256sum -- *.gz *.qcow2 vmlinuz-* initramfs-* pocket > SHA256SUMS-$ARCH)
+# fast no-KVM engine: User-Mode Linux kernel + network helper (x86_64 only)
+if [ "$UML" = 1 ] && [ "$ARCH" = x86_64 ] && [ "$GUEST" = x86_64 ]; then
+  echo "==> uml engine (kernel + pocket-net)"
+  docker buildx build --progress=plain "${SECRET[@]}" -f uml/Dockerfile --output "type=local,dest=$T/uml" uml \
+    2>&1 | tee "$T/build-uml.log" | grep -E '^#[0-9]+ (DONE|ERROR)|ERROR|MISSING' || true
+  [ -x "$T/uml/linux-uml" ] || { echo "uml build failed, log: $T/build-uml.log"; tail -40 "$T/build-uml.log"; exit 1; }
+  cp "$T/uml/linux-uml" "$D/linux-uml-x86_64"; cp "$T/uml/pocket-net" "$D/pocket-net-x86_64"
+  cp "$T/uml/uml.config" "$D/linux-uml-x86_64.config"
+fi
+(cd "$D" && sha256sum -- *.gz *.qcow2 vmlinuz-* initramfs-* pocket $(ls linux-uml-* pocket-net-* 2>/dev/null) > SHA256SUMS-$ARCH)
 ls -la "$D"

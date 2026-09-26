@@ -3,7 +3,7 @@
 #   pocket up | ssh [cmd] | down | run | desktop | status | log | reset | help
 # Settings via env: POCKET_VARIANT=base|desktop  POCKET_MEM=2048  POCKET_CPUS=auto
 #   POCKET_DISK=20G  POCKET_SSH_PORT=2222  POCKET_PORTS="8080:80 3000"
-#   POCKET_ACCEL=auto|kvm|tcg  POCKET_HOME=~/.pocket  POCKET_SHARE=~/.pocket/share
+#   POCKET_ENGINE=auto|qemu|uml  POCKET_ACCEL=auto|kvm|tcg  POCKET_HOME=~/.pocket  POCKET_SHARE=~/.pocket/share
 #   POCKET_REPO=owner/repo  POCKET_URL=<base url of release files>  POCKET_GUEST=<arch>
 #   POCKET_TAG=latest|vX.Y  GH_TOKEN=<token> (needed if the repo is private)
 set -eu
@@ -19,7 +19,7 @@ ARCH=$(uname -m); [ "$ARCH" = arm64 ] && ARCH=aarch64
 GUEST=${POCKET_GUEST:-$ARCH}          # VM arch; != host arch works but always emulated (no KVM)
 IMG=pocket-$VARIANT-$GUEST.qcow2
 VM=$H/vm-$VARIANT
-PIDF=$VM/qemu.pid
+PIDF=$VM/vm.pid
 
 die() { echo "pocket: $*" >&2; exit 1; }
 say() { echo "» $*" >&2; }
@@ -49,14 +49,53 @@ fetch() { # url dest
   mv "$2.part" "$2"
 }
 
+# engine: kvm available -> qemu (near native); x86_64 without kvm -> uml (native CPU, no root);
+# anything else -> qemu tcg (emulation, slow)
+engine() {
+  if [ -f "$VM/engine" ] && running; then cat "$VM/engine"; return; fi
+  e=${POCKET_ENGINE:-auto}
+  if [ "$e" = auto ]; then
+    if [ "$GUEST" = "$ARCH" ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then e=qemu
+    elif [ "$ARCH" = x86_64 ] && [ "$GUEST" = x86_64 ]; then e=uml
+    else e=qemu; fi
+  fi
+  [ "$e" = uml ] && { [ "$ARCH" = x86_64 ] && [ "$GUEST" = x86_64 ] || die "uml engine needs an x86_64 host and guest"; }
+  echo "$e"
+}
+
 setup() {
   mkdir -p "$H" "$VM" "$SHARE/.pocket"
+  keys_and_ca
+  if [ "$(engine)" = uml ]; then setup_uml; else setup_qemu; fi
+}
+
+setup_uml() {
+  for f in linux-uml pocket-net; do
+    fetch "$URL/$f-$GUEST" "$H/$f-$GUEST"; chmod +x "$H/$f-$GUEST"
+  done
+  UIMG=pocket-$VARIANT-$GUEST.img.gz
+  fetch "$URL/$UIMG" "$H/$UIMG"
+  if [ ! -f "$VM/disk.img" ]; then
+    say "unpacking disk"
+    # keep it sparse where the tools allow (GNU cp/dd); the guest grows the fs online to POCKET_DISK
+    if gzip -dc "$H/$UIMG" | cp --sparse=always /dev/stdin "$VM/disk.img.part" 2>/dev/null; then :
+    else gzip -dc "$H/$UIMG" > "$VM/disk.img.part"; fi
+    truncate -s "$DISK" "$VM/disk.img.part" 2>/dev/null || \
+      dd if=/dev/zero of="$VM/disk.img.part" bs=1 count=0 seek="$DISK" 2>/dev/null
+    mv "$VM/disk.img.part" "$VM/disk.img"
+  fi
+}
+
+setup_qemu() {
   QT=qemu-$ARCH-$GUEST.tar.gz
   fetch "$URL/$QT" "$H/$QT"
   [ -d "$H/qemu-$GUEST" ] || { mkdir -p "$H/qemu-$GUEST"; tar -xzf "$H/$QT" -C "$H/qemu-$GUEST"; }
   fetch "$URL/vmlinuz-$GUEST" "$H/vmlinuz-$GUEST"
   fetch "$URL/initramfs-$GUEST" "$H/initramfs-$GUEST"
   fetch "$URL/$IMG" "$H/$IMG"
+}
+
+keys_and_ca() {
   # ssh key only for this VM (port is on 127.0.0.1, but other local users can reach it)
   [ -f "$H/id_ed25519" ] || ssh-keygen -q -t ed25519 -N '' -C pocket -f "$H/id_ed25519"
   cp "$H/id_ed25519.pub" "$SHARE/.pocket/authorized_keys"
@@ -76,6 +115,36 @@ qemu() { # static binary by default; a --dynamic build ships lib/ + its own load
 
 running() { [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; }
 
+cpus() { n=$(nproc 2>/dev/null || echo 2)
+  c=${POCKET_CPUS:-auto}; [ "$c" = auto ] && { c=$n; [ "$c" -gt 4 ] && c=4; }; echo "$c"; }
+
+# UML keeps guest RAM in a file that must be on an exec-able fs with room for it
+uml_tmp() {
+  need=$(( ${MEM%%[!0-9]*} * 1024 ))
+  for d in ${POCKET_TMP:-} /dev/shm "${TMPDIR:-/tmp}" "$VM"; do
+    [ -d "$d" ] && [ -w "$d" ] || continue
+    free=$(df -Pk "$d" 2>/dev/null | awk 'NR==2{print $4}')
+    [ -n "$free" ] && [ "$free" -ge "$need" ] || continue
+    t="$d/.pocket-exec-$$"; printf '#!/bin/sh\nexit 0\n' > "$t" && chmod +x "$t" && "$t" 2>/dev/null \
+      && { rm -f "$t"; echo "$d"; return; }; rm -f "$t"
+  done
+  die "no exec-able temp dir with ${MEM}M free (set POCKET_TMP or lower POCKET_MEM)"
+}
+
+run_uml() { # $1 = console spec
+  case "$SHARE" in *" "*) die "POCKET_SHARE must not contain spaces with the uml engine";; esac
+  FWD="-p tcp:$SSHP:22"
+  P=${POCKET_PORTS:-}; [ "$VARIANT" = desktop ] && P="$P 5901 6080"
+  for p in $P; do FWD="$FWD -p tcp:${p%%:*}:${p#*:}"; done
+  T=$(uml_tmp); c=$(cpus)
+  say "engine=uml cpus=$c mem=${MEM}M  ssh=127.0.0.1:$SSHP  share=$SHARE -> /host  (ram file in $T)"
+  # shellcheck disable=SC2086
+  TMPDIR=$T exec "$H/pocket-net-$GUEST" -q $FWD -- "$H/linux-uml-$GUEST" \
+    ubd0="$VM/disk.img" root=/dev/ubda rw mem="${MEM}M" ncpus="$c" \
+    umid="pocket-$VARIANT" uml_dir="$VM" hostfs="$SHARE" pocket.share=/ \
+    con=null ssl=null con0="$1" console=tty0 quiet
+}
+
 accel() {
   a=${POCKET_ACCEL:-auto}
   if [ "$a" = auto ] && [ "$GUEST" != "$ARCH" ]; then a=tcg; fi
@@ -86,8 +155,7 @@ accel() {
 }
 
 run_vm() { # extra qemu args in "$@"
-  a=$(accel); n=$(nproc 2>/dev/null || echo 2)
-  CPUS=${POCKET_CPUS:-auto}; [ "$CPUS" = auto ] && { CPUS=$n; [ "$CPUS" -gt 4 ] && CPUS=4; }
+  a=$(accel); CPUS=$(cpus)
   if [ "$a" = kvm ]; then ACC="-accel kvm -cpu host"
   else ACC="-accel tcg,thread=multi,tb-size=512 -cpu max"; fi
   case $GUEST in
@@ -117,12 +185,20 @@ S() { ssh -q -i "$H/id_ed25519" -p "$SSHP" -o StrictHostKeyChecking=no -o UserKn
 up() {
   running && { say "already running"; return 0; }
   setup
-  run_vm -display none -serial file:"$VM/console.log" \
-    -monitor unix:"$VM/monitor.sock",server,nowait -pidfile "$PIDF" -daemonize
-  say "booting (TCG without KVM takes ~1 min) ..."
+  e=$(engine); echo "$e" > "$VM/engine"
+  if [ "$e" = uml ]; then
+    SS=; command -v setsid >/dev/null && SS=setsid   # detach from the terminal (no SIGHUP on logout)
+    $SS "$0" _uml-bg > "$VM/console.log" 2>&1 < /dev/null &
+    echo $! > "$PIDF"
+    say "booting (uml: ~10 s) ..."
+  else
+    run_vm -display none -serial file:"$VM/console.log" \
+      -monitor unix:"$VM/monitor.sock",server,nowait -pidfile "$PIDF" -daemonize
+    say "booting ($(accel): kvm ~15 s, tcg ~2 min) ..."
+  fi
   i=0; while ! S true 2>/dev/null; do
     i=$((i+1)); [ $i -gt 120 ] && die "no ssh after 10 min, see: pocket log"
-    running || die "qemu exited, see: pocket log"; sleep 5
+    running || die "vm exited, see: pocket log"; sleep 2
   done
   say "ready: pocket ssh"
   [ "$VARIANT" = desktop ] && desktop || true
@@ -145,12 +221,14 @@ case ${1:-help} in
   up) up ;;
   ssh) shift; running || up; if [ -t 0 ]; then S -t "$@"; else S "$@"; fi ;;
   down) down ;;
+  _uml-bg) run_uml null,fd:1 ;;   # internal: background UML (pid = pocket-net)
   run) setup; running && die "already running in background (pocket ssh)"
-       say "foreground console, exit: Ctrl-A X"
-       run_vm -nographic -serial mon:stdio ;;
+       if [ "$(engine)" = uml ]; then say "foreground console, exit: poweroff"; run_uml fd:0,fd:1
+       else say "foreground console, exit: Ctrl-A X"; run_vm -nographic -serial mon:stdio; fi ;;
   desktop) running || up; desktop ;;
-  status) if running; then echo "running (pid $(cat "$PIDF"), accel $(accel))"; else echo stopped; fi ;;
+  status) if running; then e=$(engine); [ "$e" = qemu ] && e="qemu/$(accel)"
+          echo "running (pid $(cat "$PIDF"), engine $e)"; else echo "stopped (next engine: $(engine))"; fi ;;
   log) tail -n 50 "$VM/console.log" ;;
-  reset) down; rm -f "$VM/disk.qcow2"; say "disk reset to pristine image" ;;
+  reset) down; rm -f "$VM/disk.qcow2" "$VM/disk.img"; say "disk reset to pristine image" ;;
   *) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//' ;;
 esac

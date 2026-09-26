@@ -109,4 +109,6 @@ cp $R/boot/vmlinuz-virt "$OUT/vmlinuz"; cp $R/boot/initramfs-virt "$OUT/initramf
 rm -rf $R/boot/* $R/var/cache/apk/*
 mke2fs -q -t ext4 -L pocket -d $R "$W/disk.raw" $FS_SIZE
 qemu-img convert -c -O qcow2 "$W/disk.raw" "$OUT/pocket-$VARIANT-$ARCH.qcow2"
+# raw ext4 for the UML engine (x86_64 only); pocket unpacks it sparse and grows it
+[ "$ARCH" = x86_64 ] && gzip -c "$W/disk.raw" > "$OUT/pocket-$VARIANT-$ARCH.img.gz"
 ls -la "$OUT"
