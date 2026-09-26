@@ -28,11 +28,14 @@ $APK add alpine-keys >/dev/null
 # ---- base system config ----
 echo pocket > $R/etc/hostname
 printf 'auto lo\niface lo inet loopback\nauto eth0\niface eth0 inet dhcp\n' > $R/etc/network/interfaces
-echo "/dev/vda / ext4 rw,noatime,discard 0 1" > $R/etc/fstab
+# /dev/root: same image boots as /dev/vda (QEMU) and /dev/ubda (UML)
+echo "/dev/root / ext4 rw,noatime 0 0" > $R/etc/fstab
 printf '%s\n' "$M/main" "$M/community" > $R/etc/apk/repositories
 sed -i 's|^tty[1-6]:|#&|' $R/etc/inittab
 CON=ttyS0; [ "$ARCH" = aarch64 ] && CON=ttyAMA0
 echo "$CON::respawn:/sbin/getty -n -l /bin/bash -L 115200 $CON vt100" >> $R/etc/inittab
+# UML console (con0) is tty0; the getty just exits where tty0 has no console
+[ "$ARCH" = x86_64 ] && echo "tty0::respawn:/sbin/getty -n -l /bin/bash 38400 tty0 vt100" >> $R/etc/inittab
 sed -i 's|^root:[^:]*:|root:*:|' $R/etc/shadow          # no password login at all
 sed -i 's|^root:\(.*\):/bin/sh$|root:\1:/bin/bash|' $R/etc/passwd
 cat >> $R/etc/ssh/sshd_config <<'EOF'
@@ -48,15 +51,30 @@ mkdir -p $R/etc/docker && echo '{"features":{"buildkit":true}}' > $R/etc/docker/
 
 en() { ln -sf /etc/init.d/$2 $R/etc/runlevels/$1/$2; }
 for s in devfs dmesg mdev hwdrivers; do en sysinit $s; done
-for s in modules sysctl hostname bootmisc syslog networking cgroups; do en boot $s; done
+for s in modules sysctl hostname bootmisc syslog pocket-uml networking cgroups; do en boot $s; done
 for s in sshd docker local; do en default $s; done
 for s in mount-ro killprocs savecache; do en shutdown $s; done
+
+# ---- UML engine glue: the vector NIC is called vec0 -> rename to eth0 before networking ----
+cat > $R/etc/init.d/pocket-uml <<'EOF'
+#!/sbin/openrc-run
+description="pocket-linux: User-Mode Linux glue (NIC name)"
+depend() { before net networking; }
+start() {
+  [ -e /sys/class/net/vec0 ] && ip link set vec0 name eth0
+  return 0
+}
+EOF
+chmod +x $R/etc/init.d/pocket-uml
 
 # ---- first-boot / every-boot glue: host share, keys, CA, disk grow ----
 cat > $R/etc/local.d/00-pocket.start <<'EOF'
 #!/bin/sh
 mkdir -p /host
-mount -t 9p -o trans=virtio,version=9p2000.L,msize=512000 host /host 2>/dev/null
+mount -t 9p -o trans=virtio,version=9p2000.L,msize=512000 host /host 2>/dev/null || {
+  S=$(sed -n 's/.*pocket\.share=\([^ ]*\).*/\1/p' /proc/cmdline)   # UML: hostfs
+  [ -n "$S" ] && mount -t hostfs -o "$S" none /host
+}
 P=/host/.pocket
 if [ -d $P ]; then
   [ -f $P/authorized_keys ] && install -Dm600 $P/authorized_keys /root/.ssh/authorized_keys
@@ -67,7 +85,7 @@ if [ -d $P ]; then
   [ -f $P/tz ] && ln -sf /usr/share/zoneinfo/$(cat $P/tz) /etc/localtime
   [ -x $P/on-boot.sh ] && $P/on-boot.sh &
 fi
-resize2fs /dev/vda >/dev/null 2>&1 &   # grow fs to overlay size (online)
+for d in /dev/vda /dev/ubda; do [ -b $d ] && { resize2fs $d >/dev/null 2>&1 & }; done   # grow fs to disk size (online)
 EOF
 if [ "$VARIANT" = desktop ]; then
 cat > $R/usr/local/bin/pocket-desktop <<'EOF'

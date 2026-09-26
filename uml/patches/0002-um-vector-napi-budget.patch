@@ -1,0 +1,18 @@
+um: vector: keep NAPI scheduled when the poll budget is exhausted
+
+net/core/dev.c keeps a NAPI instance scheduled only if poll() returns exactly
+budget without completing. Completing at work_done == budget drops the
+"more work pending" signal and stalls RX under load. Same fix as
+https://github.com/GlassOnTin/uml-transport (vector-napi-budget.patch).
+
+--- a/arch/um/drivers/vector_kern.c	2026-09-26 15:41:50.567832590 +0000
++++ b/arch/um/drivers/vector_kern.c	2026-09-26 15:41:50.587950290 +0000
+@@ -1180,7 +1180,7 @@
+ 
+ 	if (tx_enqueued || err > 0)
+ 		napi_schedule(napi);
+-	if (work_done <= budget)
++	if (work_done < budget)
+ 		napi_complete_done(napi, work_done);
+ 	return work_done;
+ }

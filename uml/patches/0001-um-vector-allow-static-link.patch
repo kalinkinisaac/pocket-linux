@@ -1,0 +1,16 @@
+um: allow CONFIG_STATIC_LINK together with the vector network driver
+
+UML_NET_VECTOR selects MAY_HAVE_RUNTIME_DEPS only because gre/l2tpv3 may resolve
+host names through NSS. pocket-linux uses the fd transport only, so a static
+binary (runs on any Linux host, any libc) is what we want.
+
+--- a/arch/um/drivers/Kconfig	2026-09-26 15:41:50.560988998 +0000
++++ b/arch/um/drivers/Kconfig	2026-09-26 15:41:50.587532415 +0000
+@@ -126,7 +126,6 @@
+ 
+ config UML_NET_VECTOR
+ 	bool "Vector I/O high performance network devices"
+-	select MAY_HAVE_RUNTIME_DEPS
+ 	help
+ 	  This User-Mode Linux network driver uses multi-message send
+ 	  and receive functions. The host running the UML guest must have
