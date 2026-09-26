@@ -7,7 +7,7 @@
 #   POCKET_REPO=owner/repo  POCKET_URL=<base url of release files>  POCKET_GUEST=<arch>
 #   POCKET_TAG=latest|vX.Y  GH_TOKEN=<token> (needed if the repo is private)
 set -eu
-REPO=${POCKET_REPO:-OWNER/pocket-linux}
+REPO=${POCKET_REPO:-kalinkinisaac/pocket-linux}
 URL=${POCKET_URL:-https://github.com/$REPO/releases/${POCKET_TAG:+download/}${POCKET_TAG:-latest/download}}
 H=${POCKET_HOME:-$HOME/.pocket}
 VARIANT=${POCKET_VARIANT:-base}

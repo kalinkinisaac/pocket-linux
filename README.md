@@ -24,15 +24,15 @@
 Публичный репозиторий:
 
 ```sh
-curl -fsSLO https://github.com/OWNER/pocket-linux/releases/latest/download/pocket && chmod +x pocket
-POCKET_REPO=OWNER/pocket-linux ./pocket up      # скачает ~200 МБ, загрузит VM
+curl -fsSLO https://github.com/kalinkinisaac/pocket-linux/releases/latest/download/pocket && chmod +x pocket
+POCKET_REPO=kalinkinisaac/pocket-linux ./pocket up      # скачает ~200 МБ, загрузит VM
 ./pocket ssh                                     # вы внутри, root
 ```
 
 Приватный репозиторий — нужен токен (fine-grained, `Contents: read` на этот репо):
 
 ```sh
-export GH_TOKEN=github_pat_xxx POCKET_REPO=OWNER/pocket-linux
+export GH_TOKEN=github_pat_xxx POCKET_REPO=kalinkinisaac/pocket-linux
 curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.raw" \
   https://api.github.com/repos/$POCKET_REPO/contents/pocket -o pocket && chmod +x pocket
 ./pocket up
