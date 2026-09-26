@@ -10,7 +10,13 @@ set -eu
 REPO=${POCKET_REPO:-kalinkinisaac/pocket-linux}
 URL=${POCKET_URL:-https://github.com/$REPO/releases/${POCKET_TAG:+download/}${POCKET_TAG:-latest/download}}
 H=${POCKET_HOME:-$HOME/.pocket}
-VARIANT=${POCKET_VARIANT:-base}
+VARIANT=${POCKET_VARIANT:-}
+if [ -z "$VARIANT" ]; then   # not set: use the VM that is already running, else base
+  for d in "$H"/vm-*; do
+    [ -f "$d/vm.pid" ] && kill -0 "$(cat "$d/vm.pid")" 2>/dev/null && { VARIANT=${d##*/vm-}; break; }
+  done
+  VARIANT=${VARIANT:-base}
+fi
 MEM=${POCKET_MEM:-2048}
 DISK=${POCKET_DISK:-20G}
 SSHP=${POCKET_SSH_PORT:-2222}

@@ -45,6 +45,9 @@ POCKET_VARIANT=desktop ./pocket up
 # браузер: http://localhost:6080/vnc.html   или VNC-клиент: localhost:5901
 ```
 
+![XFCE в pocket (движок UML, без root и KVM)](docs/desktop-uml.png)
+
+
 С удалённой машины пробросьте порт: `ssh -L 6080:localhost:6080 user@remote`.
 
 ## Команды
@@ -63,7 +66,7 @@ POCKET_VARIANT=desktop ./pocket up
 
 | переменная | по умолчанию | |
 |---|---|---|
-| `POCKET_VARIANT` | `base` | `base` (Docker, SSH) или `desktop` (+ XFCE/noVNC) |
+| `POCKET_VARIANT` | уже запущенная VM, иначе `base` | `base` (Docker, SSH) или `desktop` (+ XFCE/noVNC) |
 | `POCKET_MEM` | `2048` | МБ RAM |
 | `POCKET_CPUS` | `auto` (≤4) | vCPU; в TCG каждый vCPU — отдельный поток хоста |
 | `POCKET_DISK` | `20G` | максимальный размер диска (растёт по мере записи) |
