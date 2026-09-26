@@ -26,8 +26,20 @@ jobs:
           path: dist/${{ matrix.arch }}/*
           retention-days: 14
 
+  build-mac:   # macOS engine: vfkit + gvproxy from pinned source (VM images come from the Linux jobs)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: mac/build.sh --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pocket-darwin
+          path: dist/darwin/*
+          retention-days: 14
+
   release:
-    needs: build
+    needs: [build, build-mac]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     permissions: { contents: write }

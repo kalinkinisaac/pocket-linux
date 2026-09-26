@@ -33,8 +33,15 @@ echo "/dev/root / ext4 rw,noatime 0 0" > $R/etc/fstab
 printf '%s\n' "$M/main" "$M/community" > $R/etc/apk/repositories
 sed -i 's|^tty[1-6]:|#&|' $R/etc/inittab
 CON=ttyS0; [ "$ARCH" = aarch64 ] && CON=ttyAMA0
-echo "$CON::respawn:/sbin/getty -n -l /bin/bash -L 115200 $CON vt100" >> $R/etc/inittab
-# UML console (con0) is tty0; the getty just exits where tty0 has no console
+# root shell on every console the engine may provide: QEMU $CON, Apple VZ hvc0, UML tty0;
+# consoles that do not exist just sleep instead of respawning in a loop
+mkdir -p $R/usr/local/sbin; cat > $R/usr/local/sbin/pocket-getty <<'EOF2'
+#!/bin/sh
+[ -c /dev/$1 ] && [ -r /sys/class/tty/$1 ] || exec sleep 2147483647
+exec /sbin/getty -n -l /bin/bash -L 115200 $1 vt100
+EOF2
+chmod +x $R/usr/local/sbin/pocket-getty
+for c in $CON hvc0; do echo "::respawn:/usr/local/sbin/pocket-getty $c" >> $R/etc/inittab; done   # no id: init must not open it
 [ "$ARCH" = x86_64 ] && echo "tty0::respawn:/sbin/getty -n -l /bin/bash 38400 tty0 vt100" >> $R/etc/inittab
 sed -i 's|^root:[^:]*:|root:*:|' $R/etc/shadow          # no password login at all
 sed -i 's|^root:\(.*\):/bin/sh$|root:\1:/bin/bash|' $R/etc/passwd
@@ -45,14 +52,14 @@ UseDNS no
 EOF
 echo 'rc_cgroup_mode="unified"' >> $R/etc/rc.conf
 echo 'rc_parallel="YES"' >> $R/etc/rc.conf
-printf '%s\n' virtio_net virtio_blk 9p 9pnet_virtio overlay br_netfilter > $R/etc/modules
+printf '%s\n' virtio_net virtio_blk virtiofs 9p 9pnet_virtio overlay br_netfilter > $R/etc/modules
 printf 'net.ipv4.ip_forward=1\n' > $R/etc/sysctl.d/pocket.conf
 mkdir -p $R/etc/docker && echo '{"features":{"buildkit":true}}' > $R/etc/docker/daemon.json
 
 en() { ln -sf /etc/init.d/$2 $R/etc/runlevels/$1/$2; }
 for s in devfs dmesg mdev hwdrivers; do en sysinit $s; done
-for s in modules sysctl hostname bootmisc syslog pocket-uml networking cgroups; do en boot $s; done
-for s in sshd docker local; do en default $s; done
+for s in modules sysctl hostname bootmisc syslog pocket-uml pocket-host networking cgroups; do en boot $s; done
+for s in ntpd sshd docker local; do en default $s; done
 for s in mount-ro killprocs savecache; do en shutdown $s; done
 
 # ---- UML engine glue: the vector NIC is called vec0 -> rename to eth0 before networking ----
@@ -67,10 +74,14 @@ start() {
 EOF
 chmod +x $R/etc/init.d/pocket-uml
 
-# ---- first-boot / every-boot glue: host share, keys, CA, disk grow ----
-cat > $R/etc/local.d/00-pocket.start <<'EOF'
-#!/bin/sh
+# ---- every-boot glue: host share, keys, CA, tz, Rosetta, disk grow -- before sshd and docker ----
+cat > $R/etc/init.d/pocket-host <<'EOF'
+#!/sbin/openrc-run
+description="pocket-linux: host share, ssh key, host CA, timezone, disk grow"
+depend() { need localmount; after modules; before sshd docker; }
+start() {
 mkdir -p /host
+mount -t virtiofs host /host 2>/dev/null ||                                  # Apple VZ (macOS)
 mount -t 9p -o trans=virtio,version=9p2000.L,msize=512000 host /host 2>/dev/null || {
   S=$(sed -n 's/.*pocket\.share=\([^ ]*\).*/\1/p' /proc/cmdline)   # UML: hostfs
   [ -n "$S" ] && mount -t hostfs -o "$S" none /host
@@ -80,13 +91,22 @@ if [ -d $P ]; then
   [ -f $P/authorized_keys ] && install -Dm600 $P/authorized_keys /root/.ssh/authorized_keys
   if [ -f $P/host-ca.crt ]; then   # corporate MITM proxies: trust the host's CAs
     cp $P/host-ca.crt /usr/local/share/ca-certificates/host.crt && update-ca-certificates >/dev/null 2>&1
-    rc-service docker restart >/dev/null 2>&1 &
   fi
   [ -f $P/tz ] && ln -sf /usr/share/zoneinfo/$(cat $P/tz) /etc/localtime
-  [ -x $P/on-boot.sh ] && $P/on-boot.sh &
+fi
+# Apple VZ on Apple Silicon: run x86_64 binaries (and amd64 containers) through Rosetta
+if mkdir -p /mnt/rosetta && mount -t virtiofs rosetta /mnt/rosetta 2>/dev/null; then
+  mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null
+  printf '%s' ':rosetta:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/mnt/rosetta/rosetta:OCF' \
+    > /proc/sys/fs/binfmt_misc/register
 fi
 for d in /dev/vda /dev/ubda; do [ -b $d ] && { resize2fs $d >/dev/null 2>&1 & }; done   # grow fs to disk size (online)
+return 0
+}
 EOF
+chmod +x $R/etc/init.d/pocket-host
+# user hook, last in boot (docker is up by then)
+printf '#!/bin/sh\n[ -x /host/.pocket/on-boot.sh ] && /host/.pocket/on-boot.sh &\nexit 0\n' > $R/etc/local.d/00-pocket.start
 if [ "$VARIANT" = desktop ]; then
 cat > $R/usr/local/bin/pocket-desktop <<'EOF'
 #!/bin/sh
@@ -109,6 +129,6 @@ cp $R/boot/vmlinuz-virt "$OUT/vmlinuz"; cp $R/boot/initramfs-virt "$OUT/initramf
 rm -rf $R/boot/* $R/var/cache/apk/*
 mke2fs -q -t ext4 -L pocket -d $R "$W/disk.raw" $FS_SIZE
 qemu-img convert -c -O qcow2 "$W/disk.raw" "$OUT/pocket-$VARIANT-$ARCH.qcow2"
-# raw ext4 for the UML engine (x86_64 only); pocket unpacks it sparse and grows it
-[ "$ARCH" = x86_64 ] && gzip -c "$W/disk.raw" > "$OUT/pocket-$VARIANT-$ARCH.img.gz"
+# raw ext4 for the UML (x86_64) and Apple VZ (macOS) engines; pocket unpacks it sparse and grows it
+gzip -c "$W/disk.raw" > "$OUT/pocket-$VARIANT-$ARCH.img.gz"
 ls -la "$OUT"

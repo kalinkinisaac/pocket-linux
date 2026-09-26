@@ -62,6 +62,36 @@ Docker 28.3.3, overlay2, cgroup v2, **bridge-сеть с NAT**, контейне
 `-p 8080:80` работает; `docker run` 0.75–0.85 с (TCG 8.4 с); pull alpine 1.2 с;
 gzip 742 мс против 653 на хосте; 300 fork+exec 1104 против 251; 2000 файлов 483 против 71.
 
+### 4. macOS: Apple Virtualization.framework (движок vz)
+План был QEMU + HVF. Выбран VZ через **vfkit** (VM) + **gvproxy** (сеть), как у podman machine:
+- оба — Go-бинарники, ссылаются только на системные фреймворки → никакого бандла dylib
+  (QEMU на macOS тянет glib/pixman/…, статически не собрать);
+- гипервизор macOS без root; нужен только entitlement `com.apple.security.virtualization`,
+  ad-hoc подписи достаточно. Файлы, скачанные `curl`, не получают quarantine → Gatekeeper молчит;
+- virtio-fs вместо 9p для `/host`, Rosetta для x86_64-бинарников в arm64-госте;
+- сеть — gvproxy (стек gVisor в пространстве пользователя, аналог slirp): DHCP, DNS, NAT,
+  ssh-порт и `POCKET_PORTS` на `127.0.0.1` (через его HTTP-API на unix-сокете).
+  vmnet/`VZNATNetworkDeviceAttachment` не используем: зависит от системной сети и VPN, пробросов нет.
+
+Грабли:
+- VZ грузит только несжатый arm64 `Image`, а `vmlinuz-virt` Alpine — EFI zboot (PE с gzip внутри).
+  Смещение и размер полезной нагрузки — u32 по адресам 8 и 12 заголовка; лаунчер распаковывает
+  `tail -c | head -c | gzip -dc`, без новых артефактов.
+- VZ понимает только raw-диски → `pocket-<variant>-<arch>.img.gz` теперь собирается для всех архитектур;
+  распаковка разреженная (`dd conv=sparse` в BSD dd), 20 ГБ диска занимают ~380 МБ.
+- Консоль VZ — `hvc0`; getty на отсутствующих консолях (`ttyAMA0` под VZ) зацикливался →
+  обёртка `pocket-getty` спит, если устройства нет.
+- vfkit не завершается по SIGTERM → `down` делает `poweroff` в госте, затем `HardStop` через REST API, затем `kill -9`.
+- `vfkit ... virtio-serial,stdio` требует настоящий TTY.
+- Colima (Docker на Mac) монтирует только `$HOME` — вывод сборки в `/tmp` оставался внутри VM Colima.
+- Локальный `GOSUMDB=off`/`GOPROXY=direct` ломал `GOTOOLCHAIN=auto` → `mac/build.sh` задаёт их явно.
+
+**Результат (M2 Pro, macOS 26, 4 vCPU, 2 ГБ):** холодный `pocket up` с загрузкой файлов 6.6 с,
+тёплый — 4.1 с до SSH; Docker 28.3.3 (overlay2, cgroup v2), `docker run` ~0.1 с, amd64-контейнер
+через Rosetta ~0.1 с; `-p 8080:80` открывается с хоста; XFCE/noVNC работает. Процессы и мелкие файлы
+в госте быстрее, чем в самом macOS (fork+exec 58 мс против 185, 2000 файлов 49 против 200), gzip — 953 против 747.
+Бинарники: 12 МБ (`vz-darwin-aarch64.tar.gz`).
+
 ### Не подходят
 - Firecracker, Cloud Hypervisor, crosvm — только с KVM.
 - proot — ptrace на каждый syscall, Docker невозможен.
@@ -89,7 +119,7 @@ gzip 742 мс против 653 на хосте; 300 fork+exec 1104 против 
 - UML: проверить внутри Docker-контейнера хоста (seccomp-профиль Docker, маленький /dev/shm).
 - UML: `seccomp=on` принудительно и замерить против ptrace; проверить SMP на многоядерном хосте.
 - UML для arm64-хостов (форк zalexdev/linux-um-arm64, как у Haven) — не в mainline.
-- macOS/iOS — см. `HANDOFF-MAC.md`, `IOS.md`.
+- macOS: проверить Intel Mac (x86_64-гость, bzImage в VZ); iOS — см. `IOS.md`.
 - Режим `userns`: автоматически, если разрешены user namespaces, для задач без Docker.
 - Снапшоты (`qemu-img snapshot`) и `pocket save/restore`.
 - Образ поменьше: `linux-virt` без лишних модулей, docker без compose.
