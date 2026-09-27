@@ -4,14 +4,15 @@
 Качается из GitHub Releases одной командой, внутри — Alpine с Docker, SSH, интернетом
 и (в варианте `desktop`) XFCE-рабочим столом через браузер.
 
-Лаунчер сам выбирает движок (`POCKET_ENGINE=auto`):
+Лаунчер берёт первый доступный движок, от быстрого к медленному (`POCKET_ENGINE=auto`);
+`./pocket doctor` показывает, что из этого разрешено на машине, почему нет и что будет выбрано:
 
-| условие | движок | скорость |
+| движок | когда | скорость |
 |---|---|---|
-| macOS | **vz**: Apple Virtualization.framework (vfkit + gvproxy) | почти нативная; загрузка ~4 с; x86_64-программы через Rosetta |
-| есть доступный `/dev/kvm` | QEMU + KVM | почти нативная |
-| x86_64 без KVM | **UML** (User-Mode Linux) | CPU нативно, системные вызовы в 2–7 раз медленнее; загрузка ~6 с |
-| остальное (aarch64/riscv64 без KVM, чужая арх.) | QEMU TCG | эмуляция, в 6–17 раз медленнее; загрузка ~2 мин |
+| **vz** | macOS: Apple Virtualization.framework (vfkit + gvproxy) | почти нативная; загрузка ~4 с; x86_64-программы через Rosetta |
+| **kvm** | Linux с доступным вам `/dev/kvm`: QEMU + KVM | почти нативная |
+| **uml** | Linux x86_64: User-Mode Linux | CPU нативно, системные вызовы в 2–7 раз медленнее; загрузка ~6 с |
+| **tcg** | везде: QEMU-эмуляция | в 6–17 раз медленнее; загрузка ~2 мин |
 
 - Все бинарники **статические**: QEMU (musl), ядро UML (glibc static), `pocket-net` (musl).
   На macOS статика невозможна — `vfkit` и `gvproxy` ссылаются только на системные фреймворки.
@@ -27,6 +28,7 @@
 
 ```sh
 curl -fsSLO https://github.com/kalinkinisaac/pocket-linux/releases/latest/download/pocket && chmod +x pocket
+./pocket doctor  # что разрешено на этой машине и что будет выбрано
 ./pocket up      # скачает ~150 МБ (desktop ~450), загрузит VM
 ./pocket ssh     # вы внутри, root
 ```
@@ -57,19 +59,19 @@ POCKET_VARIANT=desktop ./pocket up
 | `pocket desktop` | поднять XFCE + noVNC (вариант desktop) |
 | `pocket status` / `log` | состояние / последние строки консоли |
 | `pocket reset` | вернуть диск к исходному образу |
+| `pocket doctor` | движки от быстрого к медленному: доступен ли, почему нет, что исправить; сеть, прокси, порт |
 
 ## Настройки (переменные окружения)
 
 | переменная | по умолчанию | |
 |---|---|---|
 | `POCKET_VARIANT` | уже запущенная VM, иначе `base` | `base` (Docker, SSH) или `desktop` (+ XFCE/noVNC) |
-| `POCKET_MEM` | `2048` | МБ RAM |
+| `POCKET_MEM` | `auto` | МБ RAM; auto — 3/4 свободной памяти хоста, от 256 до 2048 |
 | `POCKET_CPUS` | `auto` (≤4) | vCPU; в TCG каждый vCPU — отдельный поток хоста |
 | `POCKET_DISK` | `20G` | максимальный размер диска (растёт по мере записи) |
 | `POCKET_PORTS` | — | доп. пробросы: `"8080:80 3000"` → `127.0.0.1:8080→:80`, `3000→3000` |
-| `POCKET_ENGINE` | `auto` | `qemu` / `uml` принудительно (на macOS — только `vz`) |
+| `POCKET_ENGINE` | `auto` | `vz` / `kvm` / `uml` / `tcg` принудительно (`qemu` = kvm, если можно, иначе tcg) |
 | `POCKET_ROSETTA` | `1` | vz на Apple Silicon: x86_64-программы и `docker --platform linux/amd64` через Rosetta (если она стоит на Mac) |
-| `POCKET_ACCEL` | `auto` | для QEMU: `kvm` / `tcg` принудительно |
 | `POCKET_TMP` | авто | UML: каталог для файла RAM гостя (нужен exec и `POCKET_MEM` свободного места; по умолчанию `/dev/shm`, `$TMPDIR`, `~/.pocket`) |
 | `POCKET_SSH_PORT` | `2222` | порт SSH на хосте |
 | `POCKET_GUEST` | = арх. хоста | архитектура VM (чужая → только эмуляция) |

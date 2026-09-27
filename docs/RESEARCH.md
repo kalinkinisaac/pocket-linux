@@ -83,6 +83,8 @@ gzip 742 мс против 653 на хосте; 300 fork+exec 1104 против 
   обёртка `pocket-getty` спит, если устройства нет.
 - vfkit не завершается по SIGTERM → `down` делает `poweroff` в госте, затем `HardStop` через REST API, затем `kill -9`.
 - `vfkit ... virtio-serial,stdio` требует настоящий TTY.
+- Путь unix-сокета ограничен ~104 байтами (macOS) / 108 (Linux): при длинном `POCKET_HOME` gvproxy падал
+  с `bind: invalid argument` → все сокеты (vz, монитор QEMU, `uml_dir`) живут в `/tmp/pocket-<uid>` (0700, владелец проверяется).
 - Colima (Docker на Mac) монтирует только `$HOME` — вывод сборки в `/tmp` оставался внутри VM Colima.
 - Локальный `GOSUMDB=off`/`GOPROXY=direct` ломал `GOTOOLCHAIN=auto` → `mac/build.sh` задаёт их явно.
 

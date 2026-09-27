@@ -1,9 +1,10 @@
 #!/bin/sh
 # pocket — a portable Linux VM that needs no root, no installs, no KVM.
-#   pocket up | ssh [cmd] | down | run | desktop | status | log | reset | help
-# Settings via env: POCKET_VARIANT=base|desktop  POCKET_MEM=2048  POCKET_CPUS=auto
+#   pocket up | ssh [cmd] | down | run | desktop | status | log | reset | doctor | help
+#   (doctor: what this machine allows, engines fastest first, and what pocket up will pick)
+# Settings via env: POCKET_VARIANT=base|desktop  POCKET_MEM=auto(<=2048)  POCKET_CPUS=auto
 #   POCKET_DISK=20G  POCKET_SSH_PORT=2222  POCKET_PORTS="8080:80 3000"
-#   POCKET_ENGINE=auto|qemu|uml|vz  POCKET_ACCEL=auto|kvm|tcg  POCKET_HOME=~/.pocket  POCKET_SHARE=~/.pocket/share
+#   POCKET_ENGINE=auto|vz|kvm|uml|tcg  POCKET_HOME=~/.pocket  POCKET_SHARE=~/.pocket/share
 #   POCKET_REPO=owner/repo  POCKET_URL=<base url of release files>  POCKET_GUEST=<arch>
 #   POCKET_TAG=latest|vX.Y  GH_TOKEN=<token> (needed if the repo is private)
 set -eu
@@ -17,16 +18,22 @@ if [ -z "$VARIANT" ]; then   # not set: use the VM that is already running, else
   done
   VARIANT=${VARIANT:-base}
 fi
-MEM=${POCKET_MEM:-2048}
 DISK=${POCKET_DISK:-20G}
 SSHP=${POCKET_SSH_PORT:-2222}
 SHARE=${POCKET_SHARE:-$H/share}
 OS=$(uname -s)
 ARCH=$(uname -m); [ "$ARCH" = arm64 ] && ARCH=aarch64
 GUEST=${POCKET_GUEST:-$ARCH}          # VM arch; != host arch works but always emulated (no KVM)
+avail_mb() { if [ "$OS" = Darwin ]; then echo $(( $(sysctl -n hw.memsize) / 1048576 / 2 ))
+  else awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo; fi; }
+MEM=${POCKET_MEM:-auto}   # auto: 3/4 of the RAM the host can spare, 256..2048 MB
+if [ "$MEM" = auto ]; then
+  MEM=$(( $(avail_mb) * 3 / 4 / 64 * 64 )); [ "$MEM" -gt 2048 ] && MEM=2048; [ "$MEM" -lt 256 ] && MEM=256
+fi
 IMG=pocket-$VARIANT-$GUEST.qcow2
 VM=$H/vm-$VARIANT
 PIDF=$VM/vm.pid
+RUN=/tmp/pocket-$(id -u)   # unix sockets: sun_path is ~104 bytes, so a short dir private to this user
 
 die() { echo "pocket: $*" >&2; exit 1; }
 say() { echo "» $*" >&2; }
@@ -56,27 +63,53 @@ fetch() { # url dest
   mv "$2.part" "$2"
 }
 
-# engine: macOS -> vz (Apple Virtualization.framework, near native); kvm available -> qemu (near native);
-# x86_64 without kvm -> uml (native CPU, no root); anything else -> qemu tcg (emulation, slow)
+# Engines, fastest first. Each probe returns 0 if usable here, else sets WHY (reason + what would fix it).
+# `pocket up` takes the first usable one, `pocket doctor` prints all of them.
+#   vz   macOS: Apple Virtualization.framework, near native
+#   kvm  Linux: QEMU + KVM, near native
+#   uml  Linux x86_64: User-Mode Linux, native CPU, syscalls 2-7x slower, no root/KVM
+#   tcg  anywhere: QEMU emulation, 6-17x slower
+ENGINES="vz kvm uml tcg"
+can_vz() {
+  [ "$OS" = Darwin ] || { WHY="macOS only"; return 1; }
+  [ "$GUEST" = "$ARCH" ] || { WHY="guest arch must be $ARCH"; return 1; }
+  [ "$(sysctl -n kern.hv_support 2>/dev/null)" = 1 ] || { WHY="no hypervisor: this Mac is itself a VM without nested virtualization"; return 1; }
+}
+can_kvm() {
+  [ "$OS" = Linux ] || { WHY="Linux only"; return 1; }
+  [ "$GUEST" = "$ARCH" ] || { WHY="guest arch must be $ARCH"; return 1; }
+  if [ ! -e /dev/kvm ]; then
+    if [ "$ARCH" = x86_64 ] && grep -qwE 'vmx|svm' /proc/cpuinfo 2>/dev/null; then
+      WHY="CPU has VT-x/AMD-V but no /dev/kvm: kvm module not loaded (admin: modprobe kvm_intel|kvm_amd)"
+    else WHY="no /dev/kvm: no hardware virtualization here (a VM without nested virtualization?)"; fi
+    return 1
+  fi
+  [ -r /dev/kvm ] && [ -w /dev/kvm ] || {
+    WHY="/dev/kvm exists but is not yours: admin can run usermod -aG $(stat -c %G /dev/kvm 2>/dev/null || echo kvm) $(id -un)"; return 1; }
+}
+can_uml() {
+  [ "$OS" = Linux ] && [ "$ARCH" = x86_64 ] && [ "$GUEST" = x86_64 ] || { WHY="x86_64 Linux host and guest only"; return 1; }
+  uml_tmp >/dev/null || { WHY="no exec-able dir with ${MEM}M free for guest RAM (set POCKET_TMP or lower POCKET_MEM)"; return 1; }
+}
+can_tcg() { [ "$OS" = Linux ] || { WHY="no QEMU build for this OS"; return 1; }; }
+
 engine() {
   if [ -f "$VM/engine" ] && running; then cat "$VM/engine"; return; fi
   e=${POCKET_ENGINE:-auto}
-  if [ "$e" = auto ]; then
-    if [ "$OS" = Darwin ]; then e=vz
-    elif [ "$GUEST" = "$ARCH" ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then e=qemu
-    elif [ "$ARCH" = x86_64 ] && [ "$GUEST" = x86_64 ]; then e=uml
-    else e=qemu; fi
-  fi
-  [ "$OS" = Darwin ] && [ "$e" != vz ] && die "only the vz engine is available on macOS"
-  [ "$e" = vz ] && { [ "$OS" = Darwin ] && [ "$GUEST" = "$ARCH" ] || die "vz engine needs macOS and a guest of the host arch"; }
-  [ "$e" = uml ] && { [ "$ARCH" = x86_64 ] && [ "$GUEST" = x86_64 ] || die "uml engine needs an x86_64 host and guest"; }
+  case $e in
+    auto) for x in $ENGINES; do can_$x && { e=$x; break; }; done ;;
+    qemu) e=tcg; can_kvm && e=kvm ;;   # qemu = kvm if possible, else tcg
+    vz|kvm|uml|tcg) can_$e || die "engine $e: $WHY" ;;
+    *) die "unknown engine $e (auto|vz|kvm|uml|tcg|qemu)" ;;
+  esac
   echo "$e"
 }
 
 setup() {
   mkdir -p "$H" "$VM" "$SHARE/.pocket"
+  mkdir -p -m 700 "$RUN" && [ -O "$RUN" ] || die "$RUN belongs to another user"
   keys_and_ca
-  case $(engine) in uml) setup_uml;; vz) setup_vz;; *) setup_qemu;; esac
+  case $(engine) in uml) setup_uml;; vz) setup_vz;; *) setup_qemu;; esac   # kvm, tcg: qemu
 }
 
 setup_uml() {
@@ -163,9 +196,9 @@ uml_tmp() {
     free=$(df -Pk "$d" 2>/dev/null | awk 'NR==2{print $4}')
     [ -n "$free" ] && [ "$free" -ge "$need" ] || continue
     t="$d/.pocket-exec-$$"; printf '#!/bin/sh\nexit 0\n' > "$t" && chmod +x "$t" && "$t" 2>/dev/null \
-      && { rm -f "$t"; echo "$d"; return; }; rm -f "$t"
+      && { rm -f "$t"; echo "$d"; return 0; }; rm -f "$t"
   done
-  die "no exec-able temp dir with ${MEM}M free (set POCKET_TMP or lower POCKET_MEM)"
+  return 1
 }
 
 run_uml() { # $1 = console spec
@@ -173,26 +206,26 @@ run_uml() { # $1 = console spec
   FWD="-p tcp:$SSHP:22"
   P=${POCKET_PORTS:-}; [ "$VARIANT" = desktop ] && P="$P 5901 6080"
   for p in $P; do FWD="$FWD -p tcp:${p%%:*}:${p#*:}"; done
-  T=$(uml_tmp); c=$(cpus)
+  T=$(uml_tmp) || die "no exec-able temp dir with ${MEM}M free (set POCKET_TMP or lower POCKET_MEM)"; c=$(cpus)
   say "engine=uml cpus=$c mem=${MEM}M  ssh=127.0.0.1:$SSHP  share=$SHARE -> /host  (ram file in $T)"
   # shellcheck disable=SC2086
   TMPDIR=$T exec "$H/pocket-net-$GUEST" -q $FWD -- "$H/linux-uml-$GUEST" \
     ubd0="$VM/disk.img" root=/dev/ubda rw mem="${MEM}M" ncpus="$c" \
-    umid="pocket-$VARIANT" uml_dir="$VM" hostfs="$SHARE" pocket.share=/ \
+    umid="pocket-$VARIANT" uml_dir="$RUN" hostfs="$SHARE" pocket.share=/ \
     con=null ssl=null con0="$1" console=tty0 quiet
 }
 
 # vz: gvproxy (user-mode NAT like slirp, ssh + POCKET_PORTS on 127.0.0.1) + vfkit (the VM, exec'd:
 # pid = vfkit). The guest gets 192.168.127.2 via DHCP (gvproxy's static lease for this MAC).
 run_vz() { # $1 = vfkit console device
-  B=$H/vz/bin; c=$(cpus); stop_net; rm -f "$VM/net.sock" "$VM/net-api.sock" "$VM/vm-api.sock"
-  "$B/gvproxy" -listen-vfkit "unixgram://$VM/net.sock" -listen "unix://$VM/net-api.sock" -ssh-port "$SSHP" \
+  B=$H/vz/bin; c=$(cpus); stop_net; rm -f "$RUN/$VARIANT-net.sock" "$RUN/$VARIANT-net-api.sock" "$RUN/$VARIANT-vm.sock"
+  "$B/gvproxy" -listen-vfkit "unixgram://$RUN/$VARIANT-net.sock" -listen "unix://$RUN/$VARIANT-net-api.sock" -ssh-port "$SSHP" \
     -pid-file "$VM/gvproxy.pid" > "$VM/gvproxy.log" 2>&1 < /dev/null &
-  i=0; until [ -S "$VM/net.sock" ] && [ -S "$VM/net-api.sock" ]; do
+  i=0; until [ -S "$RUN/$VARIANT-net.sock" ] && [ -S "$RUN/$VARIANT-net-api.sock" ]; do
     i=$((i+1)); [ $i -gt 100 ] && die "gvproxy did not start, see $VM/gvproxy.log"; sleep 0.1; done
   P=${POCKET_PORTS:-}; [ "$VARIANT" = desktop ] && P="$P 5901 6080"
   for p in $P; do
-    curl -fsS --unix-socket "$VM/net-api.sock" http://gvproxy/services/forwarder/expose \
+    curl -fsS --unix-socket "$RUN/$VARIANT-net-api.sock" http://gvproxy/services/forwarder/expose \
       -d "{\"local\":\"127.0.0.1:${p%%:*}\",\"remote\":\"192.168.127.2:${p#*:}\"}" || die "port forward $p failed"
   done
   RO=  # Apple Silicon + Rosetta installed on the host: x86_64 binaries in the guest run through it
@@ -200,25 +233,16 @@ run_vz() { # $1 = vfkit console device
     && RO="--device rosetta,mountTag=rosetta"
   say "engine=vz cpus=$c mem=${MEM}M  ssh=127.0.0.1:$SSHP  share=$SHARE -> /host${RO:+  rosetta=on}"
   # shellcheck disable=SC2086
-  exec "$B/vfkit" --cpus "$c" --memory "$MEM" --restful-uri "unix://$VM/vm-api.sock" \
+  exec "$B/vfkit" --cpus "$c" --memory "$MEM" --restful-uri "unix://$RUN/$VARIANT-vm.sock" \
     --bootloader "linux,kernel=$H/Image-$GUEST,initrd=$H/initramfs-$GUEST,cmdline=\"root=/dev/vda rootfstype=ext4 modules=ext4,virtio_blk console=hvc0 quiet\"" \
-    --device "virtio-blk,path=$VM/disk.img" --device "virtio-net,unixSocketPath=$VM/net.sock,mac=5a:94:ef:e4:0c:ee" \
+    --device "virtio-blk,path=$VM/disk.img" --device "virtio-net,unixSocketPath=$RUN/$VARIANT-net.sock,mac=5a:94:ef:e4:0c:ee" \
     --device "virtio-fs,sharedDir=$SHARE,mountTag=host" --device virtio-rng --device "virtio-serial,$1" $RO
 }
 
 stop_net() { [ -f "$VM/gvproxy.pid" ] && kill "$(cat "$VM/gvproxy.pid")" 2>/dev/null; rm -f "$VM/gvproxy.pid"; }
 
-accel() {
-  a=${POCKET_ACCEL:-auto}
-  if [ "$a" = auto ] && [ "$GUEST" != "$ARCH" ]; then a=tcg; fi
-  if [ "$a" = auto ]; then
-    if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then a=kvm; else a=tcg; fi
-  fi
-  echo "$a"
-}
-
 run_vm() { # extra qemu args in "$@"
-  a=$(accel); CPUS=$(cpus)
+  a=$(engine); CPUS=$(cpus)
   if [ "$a" = kvm ]; then ACC="-accel kvm -cpu host"
   else ACC="-accel tcg,thread=multi,tb-size=512 -cpu max"; fi
   case $GUEST in
@@ -242,11 +266,45 @@ run_vm() { # extra qemu args in "$@"
     -device virtio-rng-pci "$@"
 }
 
+port_busy() { # something already listens on 127.0.0.1:$1 (curl's telnet:// just connects: 7 = refused)
+  command -v curl >/dev/null || return 1
+  curl -s -m 1 "telnet://127.0.0.1:$1" < /dev/null > /dev/null 2>&1; r=$?; [ $r = 0 ] || [ $r = 28 ]; }
+
+doctor() {
+  c=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "?")
+  d=$H; while [ ! -d "$d" ]; do d=$(dirname "$d"); done
+  free=$(df -Pk "$d" | awk 'NR==2{printf "%.1f GB", $4/1048576}')
+  echo "host: $OS $ARCH, $c CPU, $(avail_mb) MB RAM available, $free free in $d"
+  echo "engines, fastest first:"
+  for x in $ENGINES; do
+    if can_$x; then note=; case $x in uml) note="guest RAM file in $(uml_tmp)";; tcg) note="emulation, 6-17x slower";; esac
+      printf '  ok    %-4s %s\n' "$x" "$note"
+    else printf '  no    %-4s %s\n' "$x" "$WHY"; fi
+  done
+  echo "checks:"
+  ck() { if [ "$1" = ok ]; then printf '  ok    %s\n' "$2"; else printf '  %-5s %s\n' "$1" "$2"; fi; }
+  for t in curl ssh ssh-keygen; do command -v $t >/dev/null && ck ok "$t" || ck no "$t not found"; done
+  if [ -n "$TOKEN" ] && [ -z "${POCKET_URL:-}" ]; then ck ok "download via GitHub API with token"
+  elif curl -fsIL -m 15 -o /dev/null "$URL/pocket" 2>/dev/null; then ck ok "release files reachable: $URL"
+  else ck no "cannot reach $URL (offline? blocked? set POCKET_URL to a mirror)"; fi
+  p=${https_proxy:-${HTTPS_PROXY:-${http_proxy:-${HTTP_PROXY:-}}}}
+  [ -z "$p" ] || ck warn "a proxy is set on the host; the VM does not use it (no internet inside if direct egress is blocked)"
+  running || { port_busy "$SSHP" && ck warn "port $SSHP is taken: set POCKET_SSH_PORT"; }
+  if [ "$OS" = Linux ]; then
+    grep -q '^Seccomp:[[:space:]]*2' /proc/self/status 2>/dev/null && \
+      ck warn "processes here run under a seccomp filter (container/sandbox): uml may be refused by it"
+    [ "$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null)" = 3 ] && ck warn "ptrace is disabled (yama=3): uml must use seccomp mode"
+  fi
+  [ "$OS" = Darwin ] && [ -e /Library/Apple/usr/libexec/oah/RosettaLinux ] && ck ok "Rosetta: x86_64 programs and amd64 containers in the VM"
+  echo "pocket up will use: engine=$(engine) mem=${MEM}M cpus=$(cpus)"
+}
+
 S() { ssh -q -i "$H/id_ed25519" -p "$SSHP" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       -o LogLevel=ERROR -o ConnectTimeout=5 root@127.0.0.1 "$@"; }
 
 up() {
   running && { say "already running"; return 0; }
+  port_busy "$SSHP" && die "127.0.0.1:$SSHP is already in use: set POCKET_SSH_PORT"
   setup
   e=$(engine); echo "$e" > "$VM/engine"
   if [ "$e" = vz ]; then
@@ -260,8 +318,8 @@ up() {
     say "booting (uml: ~10 s) ..."
   else
     run_vm -display none -serial file:"$VM/console.log" \
-      -monitor unix:"$VM/monitor.sock",server,nowait -pidfile "$PIDF" -daemonize
-    say "booting ($(accel): kvm ~15 s, tcg ~2 min) ..."
+      -monitor unix:"$RUN/$VARIANT-monitor.sock",server,nowait -pidfile "$PIDF" -daemonize
+    say "booting ($(engine): kvm ~15 s, tcg ~2 min) ..."
   fi
   i=0; while ! S true 2>/dev/null; do
     i=$((i+1)); [ $i -gt 120 ] && die "no ssh after 10 min, see: pocket log"
@@ -276,7 +334,7 @@ down() {
   S poweroff 2>/dev/null || true
   i=0; while running && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done
   if running && [ "$(engine)" = vz ]; then
-    curl -fsS --unix-socket "$VM/vm-api.sock" http://vfkit/vm/state -d '{"state":"HardStop"}' >/dev/null 2>&1 || true
+    curl -fsS --unix-socket "$RUN/$VARIANT-vm.sock" http://vfkit/vm/state -d '{"state":"HardStop"}' >/dev/null 2>&1 || true
     sleep 1; running && kill -9 "$(cat "$PIDF")" 2>/dev/null
   fi
   running && kill "$(cat "$PIDF")" 2>/dev/null; rm -f "$PIDF"; stop_net; say "stopped"
@@ -300,7 +358,8 @@ case ${1:-help} in
        elif [ "$e" = uml ]; then say "foreground console, exit: poweroff"; run_uml fd:0,fd:1
        else say "foreground console, exit: Ctrl-A X"; run_vm -nographic -serial mon:stdio; fi ;;
   desktop) running || up; desktop ;;
-  status) if running; then e=$(engine); [ "$e" = qemu ] && e="qemu/$(accel)"
+  doctor) doctor ;;
+  status) if running; then e=$(engine)
           echo "running (pid $(cat "$PIDF"), engine $e)"; else echo "stopped (next engine: $(engine))"; fi ;;
   log) tail -n 50 "$VM/console.log" ;;
   reset) down; rm -f "$VM/disk.qcow2" "$VM/disk.img"; say "disk reset to pristine image" ;;
