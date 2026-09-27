@@ -25,22 +25,14 @@
 
 Одинаково на Linux и macOS (на Mac ничего ставить не нужно — `curl` и `ssh` есть в системе).
 
-Публичный репозиторий:
-
 ```sh
 curl -fsSLO https://github.com/kalinkinisaac/pocket-linux/releases/latest/download/pocket && chmod +x pocket
-POCKET_REPO=kalinkinisaac/pocket-linux ./pocket up      # скачает ~200 МБ, загрузит VM
-./pocket ssh                                     # вы внутри, root
+./pocket up      # скачает ~150 МБ (desktop ~450), загрузит VM
+./pocket ssh     # вы внутри, root
 ```
 
-Приватный репозиторий — нужен токен (fine-grained, `Contents: read` на этот репо):
-
-```sh
-export GH_TOKEN=github_pat_xxx POCKET_REPO=kalinkinisaac/pocket-linux
-curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.raw" \
-  https://api.github.com/repos/$POCKET_REPO/contents/pocket -o pocket && chmod +x pocket
-./pocket up
-```
+Свой форк или зеркало: `POCKET_REPO=owner/repo`; если он приватный — ещё `GH_TOKEN`
+(fine-grained, `Contents: read`), лаунчер тогда качает файлы через API.
 
 Рабочий стол:
 
